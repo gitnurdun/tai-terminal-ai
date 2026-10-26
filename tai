@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+#
+# tai - terminal ai
+# Turn natural language into a bash command, explain it, then run it on demand.
+#
+# Usage:
+#   tai <request>      generate a command for <request>
+#   tai                show help
+#   tai -i             interactive mode (multiple requests, no history)
+#
+# API key resolution order:
+#   $TAI_API_KEY            literal key
+#   $TAI_API_KEY_FILE       path to a file containing the key
+#   ../nurnotes/api_key     relative to this script
+#   ../nurnotes/api_key     relative to $PWD
+#   ~/nurnotes/api_key
+#   ~/.nurnotes/api_key
+
+set -uo pipefail
+
+TAI_VERSION="1.0"
+TAI_MODEL="${TAI_MODEL:-deepseek-chat}"
+TAI_API_URL="${TAI_API_URL:-https://api.deepseek.com/chat/completions}"
+TAI_TIMEOUT="${TAI_TIMEOUT:-60}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------- colors ----------
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_CYAN=""
+fi
+
+# ---------- system prompt (kept concise on purpose) ----------
+read -r -d '' TAI_SYSTEM_PROMPT <<'EOF'
+You are tai, a ubuntu  terminal assistant. Convert the user's request into ONE safe bash command.
+Respond with ONLY a JSON object and nothing else:
+{"cmd":"<single-line bash command>","explain":"<1-2 sentences: what it does; if you assumed defaults, list the arguments the user should give next time for precision; optionally a safer/faster alternative>"}
+Rules:
+- cmd must be a single line, no comments, no markdown, no surrounding quotes beyond what bash needs.
+- Prefer non-destructive options (e.g. -i, -n) and quote paths.
+- Never use sudo, rm -rf, mkfs, dd, fork bombs or network/disk destructive commands unless the user explicitly asks; if risky, still answer but warn clearly in explain.
+- When the request is vague, use sensible defaults (working dir = current dir, filename = new_file, etc.) and say which arguments to provide next time.
+EOF
+
+# ---------- chat prompt (separate from the command template) ----------
+read -r -d '' TAI_CHAT_SYSTEM_PROMPT <<'EOF'
+You are tai, a friendly and concise terminal assistant running in the user's shell.
+Have a normal conversation: answer questions, explain ideas, tell stories, brainstorm.
+Keep replies short and readable in a terminal; use plain text, no markdown tables.
+Do not output shell commands unless the user asks for one. If the user asks how to do
+something in the shell, you may include a short command in a code span.
+EOF
+
+# ---------- helpers ----------
+die() { printf '%s%s%s\n' "$C_RED" "$1" "$C_RESET" >&2; exit 1; }
+
+extract_key() {
+  # Key may sit on a line with a trailing comment, e.g. "sk-xxxx for my-app".
+  # Prefer the first sk- token; otherwise fall back to the first field.
+  local k
+  k=$(grep -oE 'sk-[A-Za-z0-9_-]+' | head -n1)
+  [ -n "$k" ] || k=$(awk 'NR==1{print $1; exit}')
+  printf '%s' "$k"
+}
+
+find_api_key() {
+  local f
+  if [ -n "${TAI_API_KEY:-}" ]; then printf '%s' "$TAI_API_KEY"; return 0; fi
+  for f in \
+    "${TAI_API_KEY_FILE:-}" \
+    "$SCRIPT_DIR/../nurnotes/api_key" \
+    "$PWD/../nurnotes/api_key" \
+    "$HOME/nurnotes/api_key" \
+    "$HOME/.nurnotes/api_key"; do
+    [ -n "$f" ] && [ -r "$f" ] && { extract_key < "$f"; return 0; }
+  done
+  return 1
+}
+
+show_help() {
+  cat <<EOF
+${C_BOLD}tai${C_RESET} - terminal ai (v$TAI_VERSION)
+
+${C_BOLD}Usage${C_RESET}
+  tai <request>      ask tai to turn a request into a bash command
+  tai -chat <msg>    have a normal conversation (no command generation)
+  tai -chat          start an interactive chat session
+  tai -i             interactive command mode (repeat requests, each call is memoryless)
+  tai                show this help
+
+${C_BOLD}Piping${C_RESET}
+  cmd | tai <request>       use piped data as context for the request
+  cmd | tai                 use piped data as the request
+  tai --quiet <request>     print only the command (for command substitution)
+  tai --run <request>       generate and run without the confirmation menu
+
+${C_BOLD}Examples${C_RESET}
+  tai move file f.txt to ~
+  tai create a folder
+  tai list the 5 largest files in this dir
+  tai -chat tell me a short story
+  cat error.log | tai "what is wrong here?"
+  tai --quiet "show disk usage" | pbcopy
+  folder=\$(cat names.txt | tai --quiet "make a dir per line")
+
+${C_BOLD}At the confirmation prompt${C_RESET}
+  Enter   run the generated command
+  e       edit the command before running (uses \$TAI_EDITOR, default nano)
+  c       copy the command to the clipboard
+  r       regenerate the command
+  q       quit without running
+
+${C_BOLD}Notes${C_RESET}
+  - Command mode is memoryless; each request is independent.
+  - Chat mode keeps history for the current session only.
+  - When input is piped, the menu is skipped (command + explanation are printed).
+  - Vague requests still get a command using defaults (cwd, new_file, ...);
+    tai tells you which arguments to add for a more accurate result.
+  - Configure with env vars: TAI_MODEL, TAI_EDITOR, TAI_API_KEY, TAI_API_KEY_FILE, TAI_TIMEOUT.
+EOF
+}
+
+# Ask the model. Prints JSON {"cmd":...,"explain":...} on stdout.
+ask_ai() {
+  local request="$1" key="$2" stdin_data="${3:-}"
+  local context user_msg payload resp content err
+
+  context="cwd: $(pwd)
+os: $(uname -s)
+files: $(ls -A 2>/dev/null | head -n 40 | paste -sd ' ' -)"
+  [ -n "$context" ] || context="cwd: $(pwd)"
+
+  user_msg="$context
+request: $request"
+  [ -n "$stdin_data" ] && user_msg="$user_msg
+stdin: $stdin_data"
+
+  payload=$(jq -n \
+    --arg model "$TAI_MODEL" \
+    --arg sys "$TAI_SYSTEM_PROMPT" \
+    --arg user "$user_msg" \
+    '{model:$model,
+      messages:[{role:"system",content:$sys},{role:"user",content:$user}],
+      temperature:0,
+      response_format:{type:"json_object"}}') || die "failed to build request (is jq installed?)"
+
+  resp=$(curl -sS --max-time "$TAI_TIMEOUT" "$TAI_API_URL" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $key" \
+    -d "$payload" 2>&1) || die "network error: $resp"
+
+  err=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)
+  [ -n "$err" ] && die "api error: $err"
+
+  content=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  [ -n "$content" ] || die "unexpected api response: $resp"
+
+  # Strip markdown fences if the model added any, then validate.
+  content=$(printf '%s' "$content" | sed -e 's/^```[a-zA-Z]*//' -e 's/```$//')
+  if ! printf '%s' "$content" | jq -e '.cmd' >/dev/null 2>&1; then
+    # Fallback: treat first line as cmd, rest as explain.
+    local cmd explain
+    cmd=$(printf '%s' "$content" | sed -n '1p')
+    explain=$(printf '%s' "$content" | sed -n '2,$p' | paste -sd ' ' -)
+    jq -n --arg c "$cmd" --arg e "$explain" '{cmd:$c,explain:$e}'
+    return
+  fi
+  printf '%s' "$content" | jq -c '{cmd,explain}'
+}
+
+# Low-level chat call. $1=key, $2=messages JSON array. Prints the reply text.
+api_chat() {
+  local key="$1" messages="$2" payload resp content err
+  payload=$(jq -n --arg model "$TAI_MODEL" --argjson msgs "$messages" \
+    '{model:$model, messages:$msgs, temperature:0.7}') || die "failed to build request (is jq installed?)"
+  resp=$(curl -sS --max-time "$TAI_TIMEOUT" "$TAI_API_URL" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $key" \
+    -d "$payload" 2>&1) || die "network error: $resp"
+  err=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null)
+  [ -n "$err" ] && die "api error: $err"
+  content=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  [ -n "$content" ] || die "unexpected api response: $resp"
+  printf '%s\n' "$content"
+}
+
+# One-shot chat: $1=key, $2=message, $3=optional stdin context.
+ask_chat() {
+  local key="$1" msg="$2" stdin_data="${3:-}" messages
+  [ -n "$stdin_data" ] && msg="${msg:+$msg
+
+}input:
+$stdin_data"
+  messages=$(jq -n --arg sys "$TAI_CHAT_SYSTEM_PROMPT" --arg u "$msg" \
+    '[{role:"system",content:$sys},{role:"user",content:$u}]')
+  api_chat "$key" "$messages"
+}
+
+# Interactive chat REPL; history is kept for the session only. $1=key.
+chat_repl() {
+  local key="$1" line messages reply
+  messages=$(jq -n --arg sys "$TAI_CHAT_SYSTEM_PROMPT" '[{role:"system",content:$sys}]')
+  printf '%stai chat - session history only; empty line or q to quit.%s\n' "$C_DIM" "$C_RESET"
+  while :; do
+    printf '\n%stai>%s ' "$C_BOLD" "$C_RESET"
+    IFS= read -r line || break
+    [ -z "$line" ] && break
+    [ "$line" = "q" ] && break
+    messages=$(jq -c --arg u "$line" '. + [{role:"user",content:$u}]' <<<"$messages")
+    printf '%sthinking...%s\r' "$C_DIM" "$C_RESET" >&2
+    reply=$(api_chat "$key" "$messages") || break
+    printf '\033[K'
+    printf '%s\n' "$reply"
+    messages=$(jq -c --arg a "$reply" '. + [{role:"assistant",content:$a}]' <<<"$messages")
+    if [ "$(jq 'length' <<<"$messages")" -gt 21 ]; then
+      messages=$(jq -c '[.[0]] + .[-20:]' <<<"$messages")
+    fi
+  done
+}
+
+is_risky() {
+  printf '%s' "$1" | grep -Eq '(^|[;&|[:space:]])(sudo|rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f|mkfs|dd[[:space:]]|shutdown|reboot|:\(\)[[:space:]]*\{)'
+}
+
+copy_to_clipboard() {
+  if command -v wl-copy >/dev/null 2>&1; then printf '%s' "$1" | wl-copy
+  elif command -v xclip >/dev/null 2>&1; then printf '%s' "$1" | xclip -selection clipboard
+  elif command -v pbcopy >/dev/null 2>&1; then printf '%s' "$1" | pbcopy
+  else return 1; fi
+}
+
+# Handle one request end-to-end. Returns 1 to quit, 0 to continue.
+handle_request() {
+  local request="$1" key="$2" stdin_data="${3:-}" json cmd explain
+  [ -n "$request" ] || [ -n "$stdin_data" ] || return 0
+  [ -n "$request" ] || request="(see stdin input)"
+
+  printf '%sthinking...%s\r' "$C_DIM" "$C_RESET" >&2
+  json=$(ask_ai "$request" "$key" "$stdin_data") || return 0
+  cmd=$(printf '%s' "$json" | jq -r '.cmd')
+  explain=$(printf '%s' "$json" | jq -r '.explain')
+  printf '\033[K' >&2
+
+  # Non-interactive paths (piped stdin or --run / --quiet): no menu.
+  if [ "$QUIET" -eq 1 ]; then
+    printf '%s\n' "$cmd"
+    return 0
+  fi
+  if [ "$STDIN_IS_PIPE" -eq 1 ] || [ "$RUN_NOW" -eq 1 ]; then
+    printf '%s$%s %s\n' "$C_GREEN" "$C_RESET" "$cmd"
+    [ -n "$explain" ] && printf '%s# %s%s\n' "$C_DIM" "$explain" "$C_RESET"
+    [ "$RUN_NOW" -eq 1 ] && bash -c "$cmd"
+    return 0
+  fi
+
+  while :; do
+    printf '\n%s$%s %s\n' "$C_GREEN" "$C_RESET" "$cmd"
+    [ -n "$explain" ] && printf '%s# %s%s\n' "$C_DIM" "$explain" "$C_RESET"
+    if is_risky "$cmd"; then
+      printf '%s! risky command detected - review carefully%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+    printf '%s[Enter]=run  e=edit  c=copy  r=regen  q=quit%s ' "$C_CYAN" "$C_RESET"
+
+    local choice; IFS= read -r choice || choice=q
+    case "$choice" in
+      "" )  # execute
+        printf '%s$ %s%s\n' "$C_DIM" "$cmd" "$C_RESET"
+        bash -c "$cmd"
+        return 0 ;;
+      q|Q) return 1 ;;
+      e|E)
+        local tmp; tmp=$(mktemp)
+        printf '%s\n' "$cmd" > "$tmp"
+        "${TAI_EDITOR:-nano}" "$tmp"
+        cmd=$(tr -d '\n' < "$tmp"); rm -f "$tmp" ;;
+      c|C)
+        if copy_to_clipboard "$cmd"; then printf '%s copied to clipboard%s\n' "$C_GREEN" "$C_RESET"
+        else printf '%s no clipboard tool found%s\n' "$C_RED" "$C_RESET"; fi ;;
+      r|R)
+        printf '%sregenerating...%s\n' "$C_DIM" "$C_RESET" >&2
+        json=$(ask_ai "$request" "$key" "$stdin_data") || return 0
+        cmd=$(printf '%s' "$json" | jq -r '.cmd')
+        explain=$(printf '%s' "$json" | jq -r '.explain') ;;
+      * ) printf '%s unknown choice: %s%s\n' "$C_YELLOW" "$choice" "$C_RESET" ;;
+    esac
+  done
+}
+
+# ---------- main ----------
+QUIET=0; RUN_NOW=0; STDIN_IS_PIPE=0; STDIN_DATA=""
+
+main() {
+  local key request
+
+  # Optional leading flags.
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -Q|--quiet|-p|--print) QUIET=1; shift ;;
+      --run) RUN_NOW=1; shift ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+
+  case "${1:-}" in
+    help|-h|--help) show_help; return 0 ;;
+    -v|--version) printf 'tai %s\n' "$TAI_VERSION"; return 0 ;;
+  esac
+
+  # No arguments on an interactive terminal: show help.
+  if [ "$#" -eq 0 ] && [ -t 0 ]; then show_help; return 0; fi
+
+  key=$(find_api_key) || die "api key not found. Set TAI_API_KEY or TAI_API_KEY_FILE, or put it in ../nurnotes/api_key"
+  command -v jq >/dev/null 2>&1 || die "jq is required but not installed"
+  command -v curl >/dev/null 2>&1 || die "curl is required but not installed"
+
+  # Capture piped input (e.g. `cat err.log | tai "what's wrong?"`).
+  if [ ! -t 0 ]; then
+    STDIN_DATA=$(cat)
+    STDIN_IS_PIPE=1
+  fi
+
+  # Still nothing to do (empty pipe, no args): show help.
+  if [ "$#" -eq 0 ] && [ -z "$STDIN_DATA" ]; then show_help; return 0; fi
+
+  if [ "${1:-}" = "-chat" ] || [ "${1:-}" = "--chat" ]; then
+    shift
+    if [ "$#" -eq 0 ]; then
+      if [ -n "$STDIN_DATA" ]; then ask_chat "$key" "" "$STDIN_DATA"
+      else chat_repl "$key"; fi
+      return 0
+    fi
+    ask_chat "$key" "$*" "$STDIN_DATA"
+    return 0
+  fi
+
+  if [ "${1:-}" = "-i" ]; then
+    printf '%stai interactive - every call is memoryless. Empty line or q to quit.%s\n' "$C_DIM" "$C_RESET"
+    local req
+    while :; do
+      printf '\n%stai>%s ' "$C_BOLD" "$C_RESET"
+      IFS= read -r req || break
+      [ -z "$req" ] && break
+      [ "$req" = "q" ] && break
+      handle_request "$req" "$key" || break
+    done
+    return 0
+  fi
+
+  request="$*"
+  [ "$request" = "-" ] && request=""
+  handle_request "$request" "$key" "$STDIN_DATA"
+}
+
+main "$@"

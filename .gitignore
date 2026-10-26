@@ -1,0 +1,6 @@
+__pycache__/
+.env
+.env.*
+api_key
+nurnotes/
+.cache/
